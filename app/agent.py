@@ -42,6 +42,7 @@ from google.adk.agents.context_cache_config import ContextCacheConfig
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.apps import App
 from google.adk.apps.app import EventsCompactionConfig, ResumabilityConfig
+from google.adk.apps.llm_event_summarizer import LlmEventSummarizer
 from google.adk.events import Event, EventActions
 from google.adk.models import Gemini
 from google.adk.planners import BuiltInPlanner
@@ -349,6 +350,88 @@ def _sanitize_a2ui_llm_request(
     return None
 
 
+def _format_live_tool_call_thought(fn_call: Any) -> str:
+    """Format a live tool invocation into a specific, readable thinking update."""
+    name = str(getattr(fn_call, "name", "") or "tool")
+    args = getattr(fn_call, "args", None) or {}
+    if not isinstance(args, dict):
+        args = {}
+
+    if name == "bq_mcp_list_datasets_and_tables":
+        proj = args.get("project_id") or USER_PROJECT
+        return (
+            f"🗂️ **[BigQuery MCP Discovery]** Calling `list_dataset_ids` and `list_table_ids` "
+            f"in project `{proj}` via `{BQ_MCP_URL}`...\n\n"
+        )
+    if name == "bq_mcp_get_table_info":
+        ds = args.get("dataset_id") or "gemini_enterprise"
+        tbl = args.get("table_id") or "usage_metrics"
+        return (
+            f"📋 **[BigQuery MCP Schema Inspection]** Inspecting column & partitioning metadata "
+            f"for `{USER_PROJECT}.{ds}.{tbl}`...\n\n"
+        )
+    if name == "bq_mcp_execute_sql_readonly":
+        sql_raw = " ".join(str(args.get("sql_query") or "").split())
+        if len(sql_raw) > 180:
+            sql_raw = sql_raw[:177] + "..."
+        return (
+            f"⚙️ **[BigQuery MCP SQL Execution]** Running `execute_sql_readonly`:\n"
+            f"`{sql_raw}`\n\n"
+        )
+    if name == "bq_mcp_create_finops_budget_alert":
+        target = args.get("target_agent_or_service") or "root_agent"
+        budget = args.get("daily_budget_usd") or 25.0
+        return (
+            f"🛡️ **[FinOps Governance Gate]** Evaluating budget alert proposal for `{target}` "
+            f"(`${budget}/day`)...\n\n"
+        )
+    if "memory" in name.lower():
+        return (
+            f"🧠 **[Vertex AI Memory Bank]** Querying `{name}` for prior session preferences & FinOps context...\n\n"
+        )
+    return f"🔧 **[Tool Call: `{name}`]** Executing with args `{redact_pii_text(str(args)[:140])}`...\n\n"
+
+
+def _format_live_tool_response_thought(fn_resp: Any) -> str | None:
+    """Format a live tool response into a concise progress thought."""
+    name = str(getattr(fn_resp, "name", "") or "tool")
+    resp = getattr(fn_resp, "response", None) or {}
+    if not isinstance(resp, dict):
+        return None
+
+    if name == "bq_mcp_list_datasets_and_tables":
+        ds_map = resp.get("datasets") or {}
+        ds_count = len(ds_map) if isinstance(ds_map, dict) else 0
+        tbl_count = (
+            sum(len(v) for v in ds_map.values() if isinstance(v, list))
+            if isinstance(ds_map, dict)
+            else 0
+        )
+        return (
+            f"✅ **[BigQuery MCP Discovery Complete]** Discovered `{ds_count}` datasets and "
+            f"`{tbl_count}` tables across `{resp.get('project_id', USER_PROJECT)}`.\n\n"
+        )
+    if name == "bq_mcp_get_table_info":
+        return (
+            f"✅ **[Table Schema Loaded]** Retrieved schema metadata for "
+            f"`{resp.get('dataset_id', '')}.{resp.get('table_id', '')}`.\n\n"
+        )
+    if name == "bq_mcp_execute_sql_readonly":
+        if resp.get("status") == "error":
+            return (
+                f"⚠️ **[BigQuery MCP Query Recovery]** Query returned `{resp.get('error_code', 'ERROR')}` — "
+                f"applying guided SQL self-correction...\n\n"
+            )
+        rows = resp.get("row_count", 0)
+        ms = resp.get("elapsed_ms", "n/a")
+        qid = resp.get("query_id", "n/a")
+        return (
+            f"✅ **[BigQuery MCP Result]** Returned `{rows}` rows in `{ms}ms` "
+            f"(`queryId={qid}`). Synthesizing insights...\n\n"
+        )
+    return None
+
+
 gemini_a2ui_specialist = Agent(
     name="gemini_a2ui_specialist",
     model=Gemini(
@@ -362,8 +445,8 @@ gemini_a2ui_specialist = Agent(
     instruction=build_specialist_instruction(USER_PROJECT),
     planner=BuiltInPlanner(
         thinking_config=types.ThinkingConfig(
-            include_thoughts=False,
-            thinking_budget=256,
+            include_thoughts=True,
+            thinking_budget=1024,
         )
     ),
     before_model_callback=_sanitize_a2ui_llm_request,
@@ -713,8 +796,6 @@ class A2UIRootRouterAgent(BaseAgent):
         is_token_finops = (
             "token usage" in lowered
             or "estimated cost by agent" in lowered
-            or "top cost drivers" in lowered
-            or "discover all gemini enterprise bigquery tables" in lowered
         )
         is_daily_usage = "daily activity" in lowered or "search pulse" in lowered
         is_audit_activity = "audit activity" in lowered or "across services" in lowered
@@ -731,24 +812,48 @@ class A2UIRootRouterAgent(BaseAgent):
             ):
                 use_canvas = True
 
-            if is_daily_usage:
-                dashboard_kind = "daily"
-                target_sql = SQL_DAILY_USAGE_METRICS
-                target_table_label = f"`{USER_PROJECT}.gemini_enterprise.usage_metrics`"
-            elif is_audit_activity:
-                dashboard_kind = "audit"
-                target_sql = SQL_AUDIT_ACTIVITY_BY_METHOD
-                target_table_label = f"`{USER_PROJECT}.gemini_enterprise_audit_logs.discoveryengine_googleapis_com_gemini_enterprise_user_activity`"
-            else:
-                dashboard_kind = "token"
-                target_sql = SQL_TOKEN_FINOPS_BY_AGENT
-                target_table_label = f"`{USER_PROJECT}.gemini_enterprise_audit_logs.discoveryengine_googleapis_com_gen_ai_client_inference_operation_details`"
-
             layout_label = (
                 "Side-Panel `Canvas` (`autoOpen: true`)"
                 if use_canvas
                 else "Inline `MaterialTabs` (`[📊 Chart]` | `[📋 Table]` | `[🔍 SQL]`)"
             )
+
+            if is_daily_usage:
+                dashboard_kind = "daily"
+                target_sql = SQL_DAILY_USAGE_METRICS
+                target_table_label = f"`{USER_PROJECT}.gemini_enterprise.usage_metrics`"
+                thought_1 = (
+                    f"📅 **[Daily Usage Pulse — Time-Series Window]** Authenticated as `{caller_detail}`. "
+                    f"Selecting daily active user (DAU) and search/answer funnel metrics from {target_table_label}...\n\n"
+                )
+                thought_2 = (
+                    f"📈 **[Daily Usage Pulse — Pivoting Interaction Funnel]** Executing time-series GoogleSQL query "
+                    f"via BigQuery MCP (`execute_sql_readonly`) to pivot daily `SEARCH`, `ANSWER`, and `ACTION` volumes...\n\n"
+                )
+            elif is_audit_activity:
+                dashboard_kind = "audit"
+                target_sql = SQL_AUDIT_ACTIVITY_BY_METHOD
+                target_table_label = f"`{USER_PROJECT}.gemini_enterprise_audit_logs.discoveryengine_googleapis_com_gemini_enterprise_user_activity`"
+                thought_1 = (
+                    f"🛡️ **[Cloud Audit Inspector — Audit Log Scope]** Authenticated as `{caller_detail}`. "
+                    f"Targeting Cloud Audit Logs table {target_table_label}...\n\n"
+                )
+                thought_2 = (
+                    f"🔍 **[Cloud Audit Inspector — Grouping API Operations]** Extracting `protoPayload.methodName` "
+                    f"(`ConverseConversation`, `Search`, `StreamAssist`, `AnswerQuery`) and service endpoints via BigQuery MCP...\n\n"
+                )
+            else:
+                dashboard_kind = "token"
+                target_sql = SQL_TOKEN_FINOPS_BY_AGENT
+                target_table_label = f"`{USER_PROJECT}.gemini_enterprise_audit_logs.discoveryengine_googleapis_com_gen_ai_client_inference_operation_details`"
+                thought_1 = (
+                    f"🧮 **[Token FinOps — Cost Model Init]** Authenticated as `{caller_detail}`. "
+                    f"Initializing Gemini 3.8 Flash prompt-caching cost rates ($0.50/1M uncached input, $0.125/1M cached input, $3.00/1M output+reasoning)...\n\n"
+                )
+                thought_2 = (
+                    f"📊 **[Token FinOps — GenAI Inference Log Query]** Aggregating `prompt_token_count`, `cached_content_token_count`, "
+                    f"`candidates_token_count`, and `thoughts_token_count` per agent from {target_table_label}...\n\n"
+                )
 
             with track_intent_outcome(
                 invocation_id=ctx.invocation_id,
@@ -766,10 +871,7 @@ class A2UIRootRouterAgent(BaseAgent):
                         role="model",
                         parts=[
                             types.Part(
-                                text=(
-                                    f"🧠 **[Synthetic Thought 1/3]** Verifying End-User OAuth 2.0 identity (`{caller_detail}`) "
-                                    f"and connecting to BigQuery MCP (`{BQ_MCP_URL}`)...\n\n"
-                                ),
+                                text=thought_1,
                                 thought=True,
                             )
                         ],
@@ -789,10 +891,7 @@ class A2UIRootRouterAgent(BaseAgent):
                         role="model",
                         parts=[
                             types.Part(
-                                text=(
-                                    f"⚙️ **[Synthetic Thought 2/3]** Executing `execute_sql_readonly` on {target_table_label} "
-                                    f"via BigQuery MCP using end-user OAuth credentials...\n\n"
-                                ),
+                                text=thought_2,
                                 thought=True,
                             )
                         ],
@@ -841,6 +940,22 @@ class A2UIRootRouterAgent(BaseAgent):
 
                 await asyncio.sleep(STEP_DELAY_SECONDS)
 
+                if is_daily_usage:
+                    thought_3 = (
+                        f"🖼️ **[Daily Usage Pulse — Rendering Multi-Series View]** Loaded `{bq_res['row_count']}` active days "
+                        f"in `{bq_res['elapsed_ms']}ms` (`queryId={bq_res['query_id']}`). Mounting daily trend `VegaChart` and sortable `GcbpTable` in {layout_label}...\n\n"
+                    )
+                elif is_audit_activity:
+                    thought_3 = (
+                        f"⚡ **[Cloud Audit Inspector — Rendering Audit Breakdown]** Analyzed `{bq_res['row_count']}` distinct Discovery Engine methods "
+                        f"in `{bq_res['elapsed_ms']}ms` (`queryId={bq_res['query_id']}`). Mounting {layout_label}...\n\n"
+                    )
+                else:
+                    thought_3 = (
+                        f"🎨 **[Token FinOps — Dashboard Assembly]** Computed cache hit ratios across `{bq_res['row_count']}` agents "
+                        f"in `{bq_res['elapsed_ms']}ms` (`queryId={bq_res['query_id']}`). Rendering stacked bar `VegaChart` and sortable `GcbpTable` in {layout_label}...\n\n"
+                    )
+
                 yield Event(
                     invocation_id=ctx.invocation_id,
                     author=self.name,
@@ -850,10 +965,7 @@ class A2UIRootRouterAgent(BaseAgent):
                         role="model",
                         parts=[
                             types.Part(
-                                text=(
-                                    f"🎨 **[Synthetic Thought 3/3]** Received `{bq_res['row_count']}` rows in `{bq_res['elapsed_ms']}ms` "
-                                    f"(`queryId={bq_res['query_id']}`). Assembling `VegaChart` and sortable `GcbpTable` in {layout_label}...\n\n"
-                                ),
+                                text=thought_3,
                                 thought=True,
                             )
                         ],
@@ -914,7 +1026,7 @@ class A2UIRootRouterAgent(BaseAgent):
                 )
                 return
 
-        # Path 3: Free-form query -> Emit clean 3-Step Synthetic Thinking timeline
+        # Path 3: Free-form / discovery question -> Stream live model thoughts & tool execution updates
         with track_intent_outcome(
             invocation_id=ctx.invocation_id,
             user_identity=user_display,
@@ -922,6 +1034,10 @@ class A2UIRootRouterAgent(BaseAgent):
             router_path="path_3_llm_specialist",
             target_resource=MODEL,
         ) as outcome:
+            prompt_preview = " ".join(user_text.split())
+            if len(prompt_preview) > 110:
+                prompt_preview = prompt_preview[:107] + "..."
+
             yield Event(
                 invocation_id=ctx.invocation_id,
                 author=self.name,
@@ -932,8 +1048,8 @@ class A2UIRootRouterAgent(BaseAgent):
                     parts=[
                         types.Part(
                             text=(
-                                f"🧠 **[Synthetic Thought 1/3]** Authenticating caller `{caller_detail}` "
-                                f"and routing query to `gemini_a2ui_specialist` (`{MODEL}`)...\n\n"
+                                f"🧠 **[Analyzing Request]** Interpreting *\"{prompt_preview}\"* "
+                                f"for `{caller_detail}` via `{MODEL}`...\n\n"
                             ),
                             thought=True,
                         )
@@ -943,70 +1059,97 @@ class A2UIRootRouterAgent(BaseAgent):
                     state_delta={"a2ui_stage": "llm_route", "a2ui_step": 1}
                 ),
             )
-            await asyncio.sleep(STEP_DELAY_SECONDS)
-
-            yield Event(
-                invocation_id=ctx.invocation_id,
-                author=self.name,
-                branch=ctx.branch,
-                partial=True,
-                content=types.Content(
-                    role="model",
-                    parts=[
-                        types.Part(
-                            text=(
-                                f"⚙️ **[Synthetic Thought 2/3]** Inspecting schemas and executing read-only GoogleSQL "
-                                f"queries via BigQuery MCP (`{BQ_MCP_URL}`)...\n\n"
-                            ),
-                            thought=True,
-                        )
-                    ],
-                ),
-                actions=EventActions(
-                    state_delta={"a2ui_stage": "llm_bq_mcp", "a2ui_step": 2}
-                ),
-            )
 
             final_answer_texts: list[str] = []
             partial_answer_texts: list[str] = []
+            emitted_thoughts: set[str] = set()
+            step_counter = 1
+
             async for ev in gemini_a2ui_specialist.run_async(ctx):
                 if not ev.content or not ev.content.parts:
                     continue
                 for part in ev.content.parts:
-                    if (
-                        getattr(part, "thought", False)
-                        or part.function_call
-                        or part.function_response
-                    ):
+                    if getattr(part, "thought", False) and part.text:
+                        t_clean = part.text.strip()
+                        if t_clean and t_clean not in emitted_thoughts:
+                            emitted_thoughts.add(t_clean)
+                            step_counter += 1
+                            yield Event(
+                                invocation_id=ctx.invocation_id,
+                                author=self.name,
+                                branch=ctx.branch,
+                                partial=True,
+                                content=types.Content(
+                                    role="model",
+                                    parts=[
+                                        types.Part(
+                                            text=f"💭 **[Model Reasoning]** {t_clean}\n\n",
+                                            thought=True,
+                                        )
+                                    ],
+                                ),
+                                actions=EventActions(
+                                    state_delta={
+                                        "a2ui_stage": "llm_thinking",
+                                        "a2ui_step": step_counter,
+                                    }
+                                ),
+                            )
                         continue
+
+                    if part.function_call:
+                        tc_thought = _format_live_tool_call_thought(part.function_call)
+                        if tc_thought not in emitted_thoughts:
+                            emitted_thoughts.add(tc_thought)
+                            step_counter += 1
+                            yield Event(
+                                invocation_id=ctx.invocation_id,
+                                author=self.name,
+                                branch=ctx.branch,
+                                partial=True,
+                                content=types.Content(
+                                    role="model",
+                                    parts=[types.Part(text=tc_thought, thought=True)],
+                                ),
+                                actions=EventActions(
+                                    state_delta={
+                                        "a2ui_stage": "llm_tool_call",
+                                        "a2ui_step": step_counter,
+                                    }
+                                ),
+                            )
+                        continue
+
+                    if part.function_response:
+                        tr_thought = _format_live_tool_response_thought(
+                            part.function_response
+                        )
+                        if tr_thought and tr_thought not in emitted_thoughts:
+                            emitted_thoughts.add(tr_thought)
+                            step_counter += 1
+                            yield Event(
+                                invocation_id=ctx.invocation_id,
+                                author=self.name,
+                                branch=ctx.branch,
+                                partial=True,
+                                content=types.Content(
+                                    role="model",
+                                    parts=[types.Part(text=tr_thought, thought=True)],
+                                ),
+                                actions=EventActions(
+                                    state_delta={
+                                        "a2ui_stage": "llm_tool_response",
+                                        "a2ui_step": step_counter,
+                                    }
+                                ),
+                            )
+                        continue
+
                     if part.text:
                         if ev.partial:
                             partial_answer_texts.append(part.text)
                         else:
                             final_answer_texts.append(part.text)
-
-            yield Event(
-                invocation_id=ctx.invocation_id,
-                author=self.name,
-                branch=ctx.branch,
-                partial=True,
-                content=types.Content(
-                    role="model",
-                    parts=[
-                        types.Part(
-                            text=(
-                                "🎨 **[Synthetic Thought 3/3]** Synthesizing FinOps insights and attaching "
-                                "interactive A2UI `v0.9` navigation controls...\n\n"
-                            ),
-                            thought=True,
-                        )
-                    ],
-                ),
-                actions=EventActions(
-                    state_delta={"a2ui_stage": "llm_complete", "a2ui_step": 3}
-                ),
-            )
-            await asyncio.sleep(STEP_DELAY_SECONDS)
 
             combined_answer = (
                 "\n\n".join(final_answer_texts).strip()
@@ -1054,6 +1197,9 @@ app = App(
     root_agent=root_agent,
     name="app",
     events_compaction_config=EventsCompactionConfig(
+        summarizer=LlmEventSummarizer(
+            llm=gemini_a2ui_specialist.canonical_model
+        ),
         token_threshold=32000,
         event_retention_size=5,
         compaction_interval=6,

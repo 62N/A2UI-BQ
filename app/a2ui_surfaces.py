@@ -339,6 +339,350 @@ def build_welcome_a2ui_messages(
     ]
 
 
+def _format_bytes_human(num_bytes: int) -> str:
+    """Format byte count into human-readable KB / MB / GB string."""
+    if num_bytes >= 1_073_741_824:
+        return f"{num_bytes / 1_073_741_824:.2f} GB"
+    if num_bytes >= 1_048_576:
+        return f"{num_bytes / 1_048_576:.2f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    return f"{num_bytes} B"
+
+
+def _parse_sql_telemetry_fallback(sql_summary_text: str) -> dict[str, Any]:
+    """Extract structured telemetry fields from `sql_summary_text` when `telemetry` dict is omitted."""
+    info: dict[str, Any] = {
+        "principal": "Authenticated User",
+        "auth_mode": "End-User Google OAuth 2.0",
+        "query_id": "n/a",
+        "total_bytes_processed": 0,
+        "total_slot_ms": "0",
+        "elapsed_ms": "n/a",
+        "sql": "",
+    }
+    if not sql_summary_text:
+        return info
+
+    if "SQL Query:\n" in sql_summary_text:
+        header_part, sql_part = sql_summary_text.split("SQL Query:\n", 1)
+        info["sql"] = sql_part.strip()
+    else:
+        header_part = sql_summary_text
+        info["sql"] = sql_summary_text.strip()
+
+    for line in header_part.splitlines():
+        s = line.strip()
+        if "Authenticated Principal:" in s:
+            val = s.split("Authenticated Principal:", 1)[1].strip()
+            if "(" in val and val.endswith(")"):
+                p_part, a_part = val.rsplit("(", 1)
+                info["principal"] = p_part.strip()
+                info["auth_mode"] = a_part[:-1].strip()
+            else:
+                info["principal"] = val
+        elif "BigQuery Job / Query ID:" in s:
+            info["query_id"] = s.split("BigQuery Job / Query ID:", 1)[1].strip()
+        elif "Bytes Processed:" in s:
+            rest = s.split("Bytes Processed:", 1)[1].strip()
+            if "|" in rest:
+                b_part, slot_part = rest.split("|", 1)
+                b_digits = "".join(ch for ch in b_part if ch.isdigit())
+                if b_digits:
+                    info["total_bytes_processed"] = int(b_digits)
+                if "Slot Time:" in slot_part:
+                    s_val = (
+                        slot_part.split("Slot Time:", 1)[1]
+                        .replace("ms", "")
+                        .strip()
+                    )
+                    info["total_slot_ms"] = s_val
+    return info
+
+
+def _build_sql_telemetry_components(
+    *,
+    prefix: str,
+    card_id: str,
+    sql_summary_text: str,
+    telemetry: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build a structured A2UI v0.9 OAuth 2.0 & BigQuery MCP Telemetry view
+    with 3 summary KPI cards, a key-value telemetry `GcbpTable`, and a line-by-line
+    monospace GoogleSQL code block."""
+    t_info = dict(_parse_sql_telemetry_fallback(sql_summary_text))
+    if telemetry:
+        for k, v in telemetry.items():
+            if v is not None and v != "":
+                t_info[k] = v
+
+    principal = str(t_info.get("principal") or "Authenticated User")
+    auth_mode = str(t_info.get("auth_mode") or "End-User Google OAuth 2.0")
+    query_id = str(t_info.get("query_id") or "n/a")
+    try:
+        bytes_int = int(t_info.get("total_bytes_processed") or 0)
+    except (ValueError, TypeError):
+        bytes_int = 0
+    bytes_human = _format_bytes_human(bytes_int)
+    slot_ms = str(t_info.get("total_slot_ms") or "0")
+    elapsed_ms = t_info.get("elapsed_ms")
+    elapsed_label = (
+        f"{elapsed_ms} ms"
+        if elapsed_ms is not None and str(elapsed_ms) != "n/a"
+        else "Live MCP"
+    )
+    row_count = t_info.get("row_count")
+    rows_label = f" • {row_count} rows" if row_count is not None else ""
+    sql_raw = str(t_info.get("sql") or "").strip()
+
+    sql_line_ids: list[str] = []
+    sql_line_components: list[dict[str, Any]] = []
+    raw_lines = [ln for ln in sql_raw.splitlines() if ln.strip()] or [
+        "-- No SQL query text recorded --"
+    ]
+    for idx, raw_ln in enumerate(raw_lines, start=1):
+        leading_spaces = len(raw_ln) - len(raw_ln.lstrip(" "))
+        indent_str = "\u00a0" * leading_spaces
+        formatted_ln = f"{indent_str}{raw_ln.lstrip(' ')}"
+        ln_id = f"{prefix}_sql_ln_{idx}"
+        sql_line_ids.append(ln_id)
+        sql_line_components.append(
+            {
+                "id": ln_id,
+                "component": "MaterialText",
+                "text": formatted_ln,
+                "usageHint": "body",
+                "style": {
+                    "fontFamily": "Roboto Mono, monospace",
+                    "fontSize": "12px",
+                    "color": "#202124",
+                },
+            }
+        )
+
+    telemetry_rows = [
+        {
+            "property": "MCP Endpoint & Transport",
+            "value": "https://bigquery.googleapis.com/mcp (Streamable HTTP JSON-RPC 2.0)",
+        },
+        {
+            "property": "MCP Tool Invoked",
+            "value": "execute_sql_readonly (Read-Only GoogleSQL Guardrail)",
+        },
+        {
+            "property": "Authenticated Principal",
+            "value": principal,
+        },
+        {
+            "property": "OAuth 2.0 Credential Flow",
+            "value": auth_mode,
+        },
+        {
+            "property": "BigQuery Job / Query ID",
+            "value": query_id,
+        },
+        {
+            "property": "Bytes Processed & Slot Time",
+            "value": f"{bytes_human} ({bytes_int:,} bytes) • {slot_ms} ms slot time • {elapsed_label}{rows_label}",
+        },
+    ]
+
+    return [
+        {
+            "id": card_id,
+            "component": "MaterialCard",
+            "appearance": "outlined",
+            "children": [f"{prefix}_sql_root_col"],
+            "style": {"padding": "16px", "borderRadius": "12px"},
+        },
+        {
+            "id": f"{prefix}_sql_root_col",
+            "component": "MaterialColumn",
+            "children": [
+                f"{prefix}_telem_header",
+                f"{prefix}_telem_kpi_row",
+                f"{prefix}_telem_table",
+                f"{prefix}_sql_code_card",
+            ],
+            "align": "stretch",
+            "style": {"gap": "12px"},
+        },
+        {
+            "id": f"{prefix}_telem_header",
+            "component": "MaterialText",
+            "text": "🔐 END-USER OAUTH 2.0 & BIGQUERY MCP EXECUTION TELEMETRY",
+            "usageHint": "caption",
+            "style": {"color": "#137333", "fontWeight": "600"},
+        },
+        {
+            "id": f"{prefix}_telem_kpi_row",
+            "component": "MaterialRow",
+            "children": [
+                f"{prefix}_telem_card_auth",
+                f"{prefix}_telem_card_job",
+                f"{prefix}_telem_card_scan",
+            ],
+            "align": "stretch",
+            "style": {"gap": "10px"},
+        },
+        {
+            "id": f"{prefix}_telem_card_auth",
+            "component": "MaterialCard",
+            "appearance": "outlined",
+            "weight": 1,
+            "children": [f"{prefix}_telem_col_auth"],
+            "style": {"padding": "10px 12px", "borderRadius": "8px"},
+        },
+        {
+            "id": f"{prefix}_telem_col_auth",
+            "component": "MaterialColumn",
+            "children": [
+                f"{prefix}_telem_lbl_auth",
+                f"{prefix}_telem_val_auth",
+                f"{prefix}_telem_sub_auth",
+            ],
+            "style": {"gap": "2px"},
+        },
+        {
+            "id": f"{prefix}_telem_lbl_auth",
+            "component": "MaterialText",
+            "text": "OAUTH 2.0 PRINCIPAL",
+            "usageHint": "caption",
+            "style": {"color": "#137333", "fontWeight": "600"},
+        },
+        {
+            "id": f"{prefix}_telem_val_auth",
+            "component": "MaterialText",
+            "text": principal,
+            "usageHint": "body",
+            "style": {"fontWeight": "600"},
+        },
+        {
+            "id": f"{prefix}_telem_sub_auth",
+            "component": "MaterialText",
+            "text": auth_mode,
+            "usageHint": "caption",
+            "style": {"color": "#5f6368"},
+        },
+        {
+            "id": f"{prefix}_telem_card_job",
+            "component": "MaterialCard",
+            "appearance": "outlined",
+            "weight": 1,
+            "children": [f"{prefix}_telem_col_job"],
+            "style": {"padding": "10px 12px", "borderRadius": "8px"},
+        },
+        {
+            "id": f"{prefix}_telem_col_job",
+            "component": "MaterialColumn",
+            "children": [
+                f"{prefix}_telem_lbl_job",
+                f"{prefix}_telem_val_job",
+                f"{prefix}_telem_sub_job",
+            ],
+            "style": {"gap": "2px"},
+        },
+        {
+            "id": f"{prefix}_telem_lbl_job",
+            "component": "MaterialText",
+            "text": "MCP LATENCY & ROWS",
+            "usageHint": "caption",
+            "style": {"color": "#1a73e8", "fontWeight": "600"},
+        },
+        {
+            "id": f"{prefix}_telem_val_job",
+            "component": "MaterialText",
+            "text": f"{elapsed_label}{rows_label}",
+            "usageHint": "body",
+            "style": {"fontWeight": "600"},
+        },
+        {
+            "id": f"{prefix}_telem_sub_job",
+            "component": "MaterialText",
+            "text": f"Job ID: {query_id}",
+            "usageHint": "caption",
+            "style": {"color": "#5f6368"},
+        },
+        {
+            "id": f"{prefix}_telem_card_scan",
+            "component": "MaterialCard",
+            "appearance": "outlined",
+            "weight": 1,
+            "children": [f"{prefix}_telem_col_scan"],
+            "style": {"padding": "10px 12px", "borderRadius": "8px"},
+        },
+        {
+            "id": f"{prefix}_telem_col_scan",
+            "component": "MaterialColumn",
+            "children": [
+                f"{prefix}_telem_lbl_scan",
+                f"{prefix}_telem_val_scan",
+                f"{prefix}_telem_sub_scan",
+            ],
+            "style": {"gap": "2px"},
+        },
+        {
+            "id": f"{prefix}_telem_lbl_scan",
+            "component": "MaterialText",
+            "text": "DATA SCANNED & SLOTS",
+            "usageHint": "caption",
+            "style": {"color": "#9334e6", "fontWeight": "600"},
+        },
+        {
+            "id": f"{prefix}_telem_val_scan",
+            "component": "MaterialText",
+            "text": f"{bytes_human} ({bytes_int:,} B)",
+            "usageHint": "body",
+            "style": {"fontWeight": "600"},
+        },
+        {
+            "id": f"{prefix}_telem_sub_scan",
+            "component": "MaterialText",
+            "text": f"Slot Time: {slot_ms} ms • execute_sql_readonly",
+            "usageHint": "caption",
+            "style": {"color": "#5f6368"},
+        },
+        {
+            "id": f"{prefix}_telem_table",
+            "component": "GcbpTable",
+            "columns": [
+                {"header": "Telemetry Property", "field": "property", "sortable": False},
+                {"header": "Execution Value", "field": "value", "sortable": False},
+            ],
+            "rows": telemetry_rows,
+        },
+        {
+            "id": f"{prefix}_sql_code_card",
+            "component": "MaterialCard",
+            "appearance": "outlined",
+            "children": [f"{prefix}_sql_code_col"],
+            "style": {
+                "padding": "12px 14px",
+                "borderRadius": "8px",
+                "backgroundColor": "#f8f9fa",
+            },
+        },
+        {
+            "id": f"{prefix}_sql_code_col",
+            "component": "MaterialColumn",
+            "children": [
+                f"{prefix}_sql_code_heading",
+                *sql_line_ids,
+            ],
+            "align": "stretch",
+            "style": {"gap": "3px"},
+        },
+        {
+            "id": f"{prefix}_sql_code_heading",
+            "component": "MaterialText",
+            "text": "📜 EXECUTED GOOGLESQL QUERY (BIGQUERY MCP READ-ONLY)",
+            "usageHint": "caption",
+            "style": {"color": "#1a73e8", "fontWeight": "600"},
+        },
+        *sql_line_components,
+    ]
+
+
 def build_inline_tabs_finops_a2ui_messages(
     *,
     surface_id: str,
@@ -352,6 +696,7 @@ def build_inline_tabs_finops_a2ui_messages(
     sql_summary_text: str,
     canvas_switch_prompt: str,
     active_tab: int = 0,
+    telemetry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build an inline A2UI v0.9 dashboard using `MaterialCard` KPIs + `MaterialTabs`
     switching between `[📊 Vega-Lite Chart]`, `[📋 Data Table]`, and `[🔍 SQL & OAuth]`."""
@@ -394,6 +739,13 @@ def build_inline_tabs_finops_a2ui_messages(
                 },
             ]
         )
+
+    sql_telemetry_components = _build_sql_telemetry_components(
+        prefix="tab",
+        card_id="tab_sql_card",
+        sql_summary_text=sql_summary_text,
+        telemetry=telemetry,
+    )
 
     components: list[dict[str, Any]] = [
         {
@@ -490,25 +842,7 @@ def build_inline_tabs_finops_a2ui_messages(
             "columns": table_columns,
             "rows": table_rows,
         },
-        {
-            "id": "tab_sql_card",
-            "component": "MaterialCard",
-            "appearance": "outlined",
-            "children": ["tab_sql_col"],
-            "style": {"padding": "14px", "borderRadius": "12px"},
-        },
-        {
-            "id": "tab_sql_col",
-            "component": "MaterialColumn",
-            "children": ["sql_summary_text"],
-            "align": "stretch",
-        },
-        {
-            "id": "sql_summary_text",
-            "component": "Text",
-            "text": sql_summary_text,
-            "variant": "body",
-        },
+        *sql_telemetry_components,
         {
             "id": "finops_footer_row",
             "component": "MaterialRow",
@@ -588,6 +922,7 @@ def build_canvas_finops_a2ui_messages(
     table_rows: list[dict[str, str]],
     sql_summary_text: str,
     inline_switch_prompt: str,
+    telemetry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build a Side-Panel `Canvas`-rooted A2UI v0.9 dashboard (`autoOpen: true`)
     with KPI `MaterialCard`s, interactive `VegaChart`, and sortable `GcbpTable`."""
@@ -630,6 +965,13 @@ def build_canvas_finops_a2ui_messages(
                 },
             ]
         )
+
+    canvas_sql_telemetry_components = _build_sql_telemetry_components(
+        prefix="canvas",
+        card_id="canvas_sql_card",
+        sql_summary_text=sql_summary_text,
+        telemetry=telemetry,
+    )
 
     components: list[dict[str, Any]] = [
         {
@@ -743,25 +1085,7 @@ def build_canvas_finops_a2ui_messages(
             "columns": table_columns,
             "rows": table_rows,
         },
-        {
-            "id": "canvas_sql_card",
-            "component": "MaterialCard",
-            "appearance": "outlined",
-            "children": ["canvas_sql_col"],
-            "style": {"padding": "12px 14px", "borderRadius": "10px"},
-        },
-        {
-            "id": "canvas_sql_col",
-            "component": "MaterialColumn",
-            "children": ["canvas_sql_text"],
-            "align": "stretch",
-        },
-        {
-            "id": "canvas_sql_text",
-            "component": "Text",
-            "text": sql_summary_text,
-            "variant": "body",
-        },
+        *canvas_sql_telemetry_components,
         {
             "id": "canvas_footer_row",
             "component": "MaterialRow",
@@ -1390,6 +1714,7 @@ def _build_token_finops_dashboard_payload(
             table_rows=table_rows,
             sql_summary_text=sql_summary_text,
             inline_switch_prompt=STARTER_PROMPT_1,
+            telemetry=bq_res,
         )
     else:
         messages = build_inline_tabs_finops_a2ui_messages(
@@ -1404,6 +1729,7 @@ def _build_token_finops_dashboard_payload(
             sql_summary_text=sql_summary_text,
             canvas_switch_prompt="Open token usage & estimated cost by agent in Side-Panel Canvas",
             active_tab=active_tab,
+            telemetry=bq_res,
         )
     return summary_md, messages
 
@@ -1531,6 +1857,7 @@ def _build_daily_usage_dashboard_payload(
             table_rows=table_rows,
             sql_summary_text=sql_summary_text,
             inline_switch_prompt="Show Gemini Enterprise daily activity & search pulse in inline MaterialTabs",
+            telemetry=bq_res,
         )
     else:
         messages = build_inline_tabs_finops_a2ui_messages(
@@ -1545,6 +1872,7 @@ def _build_daily_usage_dashboard_payload(
             sql_summary_text=sql_summary_text,
             canvas_switch_prompt=STARTER_PROMPT_2,
             active_tab=active_tab,
+            telemetry=bq_res,
         )
     return summary_md, messages
 
@@ -1657,6 +1985,7 @@ def _build_audit_activity_dashboard_payload(
             table_rows=table_rows,
             sql_summary_text=sql_summary_text,
             inline_switch_prompt=STARTER_PROMPT_3,
+            telemetry=bq_res,
         )
     else:
         messages = build_inline_tabs_finops_a2ui_messages(
@@ -1671,5 +2000,6 @@ def _build_audit_activity_dashboard_payload(
             sql_summary_text=sql_summary_text,
             canvas_switch_prompt="Open Gemini Enterprise API & agent audit activity in Side-Panel Canvas",
             active_tab=active_tab,
+            telemetry=bq_res,
         )
     return summary_md, messages

@@ -349,6 +349,9 @@ def test_inline_tabs_and_side_panel_canvas_a2ui_surfaces() -> None:
     assert tabs_comps["vega_chart_main"]["component"] == "VegaChart"
     assert tabs_comps["vega_chart_main"]["spec"] == {"path": "/vegaSpec"}
     assert tabs_comps["gcbp_table_main"]["component"] == "GcbpTable"
+    assert tabs_comps["tab_telem_kpi_row"]["component"] == "MaterialRow"
+    assert tabs_comps["tab_telem_table"]["component"] == "GcbpTable"
+    assert tabs_comps["tab_sql_code_card"]["component"] == "MaterialCard"
 
     # 2. Side-Panel Canvas surface
     _, canvas_msgs = _build_daily_usage_dashboard_payload(
@@ -373,6 +376,9 @@ def test_inline_tabs_and_side_panel_canvas_a2ui_surfaces() -> None:
     assert canvas_comps["root"]["autoOpen"] is True
     assert canvas_comps["canvas_vega_chart"]["component"] == "VegaChart"
     assert canvas_comps["canvas_gcbp_table"]["component"] == "GcbpTable"
+    assert canvas_comps["canvas_telem_kpi_row"]["component"] == "MaterialRow"
+    assert canvas_comps["canvas_telem_table"]["component"] == "GcbpTable"
+    assert canvas_comps["canvas_sql_code_card"]["component"] == "MaterialCard"
 
 
 def test_oauth_token_extraction() -> None:
@@ -460,6 +466,7 @@ def test_memory_service_and_conversation_history_compaction() -> None:
     mem_service = services.get_memory_service()
     assert mem_service is not None
     assert adk_app.events_compaction_config is not None
+    assert adk_app.events_compaction_config.summarizer is not None
     assert adk_app.events_compaction_config.token_threshold == 32000
     assert adk_app.resumability_config is not None
     assert adk_app.resumability_config.is_resumable is True

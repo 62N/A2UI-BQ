@@ -81,6 +81,7 @@ from app.oauth_bq_mcp import (
     is_google_oauth_access_token,
     resolve_google_oauth_userinfo,
 )
+from app.observability import log_structured_event, scrub_pii
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -371,9 +372,15 @@ def _extract_caller_identity(
         ),
         "meta_keys": sorted(combined_meta.keys()),
     }
-    log_copy = {k: v for k, v in identity_info.items() if k != "user_oauth_token"}
-    logger.info("A2A caller_identity resolved: %s", json.dumps(log_copy))
-    print(f"A2A caller_identity resolved: {json.dumps(log_copy)}", flush=True)
+    log_copy = scrub_pii(
+        {k: v for k, v in identity_info.items() if k != "user_oauth_token"}
+    )
+    log_structured_event(
+        "A2A_CALLER_IDENTITY_RESOLVED",
+        "Resolved and scrubbed A2A caller identity",
+        component="a2a",
+        structured_data=log_copy,
+    )
     return identity_info
 
 

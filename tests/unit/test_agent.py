@@ -28,13 +28,28 @@ from google.protobuf.json_format import MessageToDict
 
 from app.agent import (
     A2UI_V09_CATALOG_ID,
+    DatasetAndTableListRequest,
+    DatasetAndTableListResponse,
+    ExecuteReadonlySqlRequest,
+    ExecuteReadonlySqlResponse,
+    FinOpsBudgetAlertActionRequest,
+    FinOpsBudgetAlertActionResponse,
+    GuidedToolErrorRecovery,
     STARTER_PROMPTS_LIST,
     _build_daily_usage_dashboard_payload,
     _build_token_finops_dashboard_payload,
+    _classify_and_build_error_recovery,
+    app as adk_app,
+    bq_mcp_create_finops_budget_alert,
+    build_hitl_confirmation_a2ui_messages,
     build_welcome_a2ui_messages,
+    compact_conversation_history,
+    enforce_hitl_and_sql_guardrails,
+    finops_budget_alert_hitl_tool,
     make_a2ui_genai_parts,
     root_agent,
 )
+from app.app_utils import services
 from app.app_utils.a2a import (
     _A2UI_MIME_TYPE,
     _A2UI_V09_EXTENSION_URI,
@@ -45,6 +60,12 @@ from app.app_utils.a2a import (
 )
 from app.fast_api_app import app
 from app.oauth_bq_mcp import extract_candidate_user_token
+from app.observability import (
+    redact_pii_text,
+    redact_principal,
+    scrub_pii,
+    track_intent_outcome,
+)
 
 
 def test_agent_card_includes_a2ui_and_starter_prompts() -> None:
@@ -403,5 +424,128 @@ def test_gcbp_table_fetch_data_sorting_keeps_full_dashboard() -> None:
     assert comps["finops_tabs"]["activeTab"] == 1
     rows = comps["gcbp_table_main"]["rows"]
     assert [r["agent_name"] for r in rows] == ["alpha_agent", "root_agent"]
+
+
+def test_strict_pydantic_tool_schemas_and_guided_error_recovery() -> None:
+    """Verify strict Pydantic JSON schemas on tool I/O and guided error recovery instructions."""
+    assert "properties" in DatasetAndTableListRequest.model_json_schema()
+    assert "properties" in DatasetAndTableListResponse.model_json_schema()
+    assert "properties" in ExecuteReadonlySqlRequest.model_json_schema()
+    assert "properties" in ExecuteReadonlySqlResponse.model_json_schema()
+    assert "properties" in FinOpsBudgetAlertActionRequest.model_json_schema()
+    assert "properties" in FinOpsBudgetAlertActionResponse.model_json_schema()
+    assert "properties" in GuidedToolErrorRecovery.model_json_schema()
+
+    err_404 = _classify_and_build_error_recovery(
+        "bq_mcp_execute_sql_readonly",
+        RuntimeError("404 Not found: Table my-proj:ds.missing_table"),
+    )
+    assert err_404.error_code == "NOT_FOUND"
+    assert err_404.is_retryable is True
+    assert err_404.suggested_fallback_tool == "bq_mcp_list_datasets_and_tables"
+    assert len(err_404.recovery_steps) >= 2
+
+    blocked = enforce_hitl_and_sql_guardrails(
+        "bq_mcp_execute_sql_readonly",
+        {"sql_query": "DROP TABLE usage_metrics"},
+        None,  # type: ignore[arg-type]
+    )
+    assert blocked is not None
+    assert blocked["status"] == "error"
+    assert blocked["error_code"] == "INVALID_SQL"
+
+
+def test_memory_service_and_conversation_history_compaction() -> None:
+    """Verify GCP Memory Service registration, EventsCompactionConfig, and turn compaction."""
+    mem_service = services.get_memory_service()
+    assert mem_service is not None
+    assert adk_app.events_compaction_config is not None
+    assert adk_app.events_compaction_config.token_threshold == 32000
+    assert adk_app.resumability_config is not None
+    assert adk_app.resumability_config.is_resumable is True
+
+    long_turns = [
+        genai_types.Content(
+            role="user" if i % 2 == 0 else "model",
+            parts=[genai_types.Part.from_text(text=f"Turn {i} message about analyst@example.com")],
+        )
+        for i in range(12)
+    ]
+    compacted = compact_conversation_history(
+        long_turns, max_turns=6, keep_recent_turns=3
+    )
+    assert len(compacted) == 4
+    assert "[Compacted Session Context Summary" in (compacted[0].parts[0].text or "")
+    assert "analyst@example.com" not in (compacted[0].parts[0].text or "")
+
+
+def test_hitl_confirmation_tool_and_a2ui_gate() -> None:
+    """Verify HITL confirmation gate on FunctionTool and A2UI v0.9 confirmation surface."""
+    assert finops_budget_alert_hitl_tool._require_confirmation is True
+    unconfirmed = bq_mcp_create_finops_budget_alert(
+        target_agent_or_service="root_agent",
+        daily_budget_usd=25.0,
+        tool_context=None,
+    )
+    assert unconfirmed["status"] == "confirmation_required"
+    assert unconfirmed["requires_human_confirmation"] is True
+
+    hitl_msgs = build_hitl_confirmation_a2ui_messages(
+        surface_id="hitl-test-1",
+        action_title="Confirm Budget Alert",
+        action_summary="Confirm $25/day threshold",
+        confirm_prompt="Approve",
+    )
+    assert len(hitl_msgs) == 2
+    comps = {c["id"]: c for c in hitl_msgs[1]["updateComponents"]["components"]}
+    assert comps["hitl_approve_btn"]["action"]["event"]["name"] == "hitl.confirm"
+    assert comps["hitl_cancel_btn"]["action"]["event"]["name"] == "hitl.reject"
+
+
+def test_observability_pii_redaction_and_intent_outcome_tracing() -> None:
+    """Verify PII scrubbing, OpenTelemetry span tracking, and /feedback endpoint."""
+    pseudonym = redact_principal("john.doe@company.com")
+    assert "john.doe" not in pseudonym
+    assert pseudonym.startswith("user_")
+
+    scrubbed_str = redact_pii_text(
+        "Caller john.doe@company.com with token ya29.a0AfH6SMBx123456"
+    )
+    assert "john.doe@company.com" not in scrubbed_str
+    assert "ya29.a0AfH6SMBx123456" not in scrubbed_str
+    assert "[REDACTED_OAUTH_TOKEN]" in scrubbed_str
+
+    scrubbed_dict = scrub_pii(
+        {
+            "human_user": "alice@example.org",
+            "user_oauth_token": "ya29.secret",
+            "nested": {"email": "bob@example.org"},
+        }
+    )
+    assert scrubbed_dict["user_oauth_token"] == "[REDACTED_TOKEN]"
+    assert "alice" not in scrubbed_dict["human_user"]
+    assert "bob" not in scrubbed_dict["nested"]["email"]
+
+    with track_intent_outcome(
+        invocation_id="inv-test-1",
+        user_identity="alice@example.org",
+        classified_intent="token_finops",
+        router_path="path_2_finops_dashboard",
+        target_resource="usage_metrics",
+    ) as tracker:
+        tracker["surface_id"] = "agent-finops-1234"
+        tracker["row_count"] = 5
+
+    with TestClient(app) as client:
+        fb_resp = client.post(
+            "/feedback",
+            json={
+                "score": 5,
+                "text": "Great FinOps dashboard from alice@example.org!",
+            },
+        )
+        assert fb_resp.status_code == 200
+        assert fb_resp.json()["status"] == "success"
+
 
 

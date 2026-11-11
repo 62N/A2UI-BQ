@@ -36,15 +36,19 @@ An end-to-end **A2A Protocol (`v0.3.0`) + A2UI (`v0.9`)** reference agent for **
 
 ```text
 ├── app/
-│   ├── agent.py                 # A2UIRootRouterAgent, A2UI v0.9 builders (MaterialTabs & Canvas), BigQuery MCP tools
+│   ├── agent.py                 # A2UIRootRouterAgent, ADK App config (Compaction, Resumability, Memory Bank, Plugins)
+│   ├── prompts.py               # Starter prompts, BigQuery FinOps SQL templates, and specialist LLM instructions
+│   ├── tools.py                 # Strict Pydantic tool I/O schemas, GuidedToolErrorRecovery, BigQuery MCP & HITL tools
+│   ├── a2ui_surfaces.py         # A2UI v0.9 surface builders (Welcome, MaterialTabs, Side-Panel Canvas, HITL cards)
+│   ├── observability.py         # Cloud Logging StructuredLogHandler, PIIRedactionFilter, OpenTelemetry & FinOps plugin
 │   ├── oauth_bq_mcp.py          # End-user Google OAuth 2.0 / Entra WIF extraction & BigQuery MCP JSON-RPC client
-│   ├── fast_api_app.py          # FastAPI server + OAuthCaptureMiddleware + A2A route mounting
+│   ├── fast_api_app.py          # FastAPI server + OAuthCaptureMiddleware + A2A route mounting + /feedback endpoint
 │   └── app_utils/
 │       ├── a2a.py               # Custom A2A v0.3.0 <-> ADK converters, A2UI DataPart & thought separation
-│       └── services.py          # ADK session & artifact service configuration
+│       └── services.py          # ADK VertexAiSessionService, GcsArtifactService & VertexAiMemoryBankService
 ├── tests/
 │   ├── unit/
-│   │   └── test_agent.py        # Unit tests for A2UI surfaces, VegaChart data model binding, sorting, and OAuth
+│   │   └── test_agent.py        # 11 unit tests covering A2UI, OAuth, Pydantic schemas, Memory, HITL, and Observability
 │   └── eval/                    # Agent evaluation datasets and configuration
 ├── AGENTS.md                    # Engineering guide for A2UI v0.9 + BigQuery MCP in Gemini Enterprise
 ├── sync_ge_metadata.py          # Registers / updates the agent and OAuth config in Gemini Enterprise

@@ -1,29 +1,48 @@
 {
   "eval_cases": [
     {
-      "eval_case_id": "greeting",
+      "eval_case_id": "welcome_greeting",
       "prompt": {
         "role": "user",
-        "parts": [{"text": "Hello, what can you help me with?"}]
+        "parts": [{"text": "Show the A2UI v0.9 welcome view and starter prompt cards"}]
       }
     },
     {
-      "eval_case_id": "weather_query",
+      "eval_case_id": "token_finops_inline_tabs",
       "prompt": {
         "role": "user",
-        "parts": [{"text": "What's the weather like in San Francisco?"}]
-      }
-    },
-    {
-      "eval_case_id": "capital_lookup",
-      "prompt": {
-        "role": "user",
-        "parts": [{"text": "What is the capital of France?"}]
+        "parts": [{"text": "Show token usage & estimated cost by agent in inline MaterialTabs"}]
       },
       "reference": {
         "response": {
           "role": "model",
-          "parts": [{"text": "The capital of France is Paris."}]
+          "parts": [{"text": "Gemini Enterprise Token FinOps Pulse (Inline MaterialTabs)"}]
+        }
+      }
+    },
+    {
+      "eval_case_id": "daily_usage_canvas",
+      "prompt": {
+        "role": "user",
+        "parts": [{"text": "Open Gemini Enterprise daily activity & search pulse in Side-Panel Canvas"}]
+      },
+      "reference": {
+        "response": {
+          "role": "model",
+          "parts": [{"text": "Gemini Enterprise Daily Activity & DAU Pulse (Side-Panel Canvas)"}]
+        }
+      }
+    },
+    {
+      "eval_case_id": "hitl_budget_alert_gate",
+      "prompt": {
+        "role": "user",
+        "parts": [{"text": "Create a FinOps budget alert for root_agent"}]
+      },
+      "reference": {
+        "response": {
+          "role": "model",
+          "parts": [{"text": "Confirmation Required: Please review and approve the proposed FinOps budget alert below."}]
         }
       }
     }

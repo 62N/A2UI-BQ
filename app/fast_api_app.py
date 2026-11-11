@@ -30,8 +30,16 @@ from app.oauth_bq_mcp import (
     is_google_oauth_access_token,
     is_service_account_oidc_jwt,
 )
+from app.observability import (
+    Feedback,
+    configure_structured_logging,
+    log_structured_event,
+    redact_pii_text,
+    trace_span,
+)
 
 load_dotenv()
+configure_structured_logging()
 allow_origins = (
     os.getenv("ALLOW_ORIGINS", "").split(",") if os.getenv("ALLOW_ORIGINS") else None
 )
@@ -69,7 +77,20 @@ class OAuthCaptureMiddleware:
                         token = val
         reset = current_oauth_token_var.set(token)
         try:
-            await self.app(scope, receive, send)  # type: ignore[misc]
+            if scope.get("type") == "http":
+                path = scope.get("path", "")
+                method = scope.get("method", "GET")
+                with trace_span(
+                    "a2ui_bq.http.request",
+                    attributes={
+                        "http.method": method,
+                        "http.route": path,
+                        "oauth.has_user_token": bool(token),
+                    },
+                ):
+                    await self.app(scope, receive, send)  # type: ignore[misc]
+            else:
+                await self.app(scope, receive, send)  # type: ignore[misc]
         finally:
             current_oauth_token_var.reset(reset)
 
@@ -83,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app=adk_app,
         session_service=services.get_session_service(),
         artifact_service=services.get_artifact_service(),
+        memory_service=services.get_memory_service(),
         auto_create_session=True,
     )
     app.state.runner = runner
@@ -101,6 +123,7 @@ app: FastAPI = get_fast_api_app(
     agents_dir=AGENT_DIR,
     web=True,
     artifact_service_uri=services.ARTIFACT_SERVICE_URI,
+    memory_service_uri=services.MEMORY_SERVICE_URI,
     allow_origins=allow_origins,
     session_service_uri=services.SESSION_SERVICE_URI,
     otel_to_cloud=otel_to_cloud,
@@ -109,6 +132,21 @@ app: FastAPI = get_fast_api_app(
 app.title = "a2ui-bq-agent"
 app.description = "API for interacting with the A2UI-BQ Gemini Enterprise FinOps Agent"
 app.add_middleware(OAuthCaptureMiddleware)
+
+
+@app.post("/feedback")
+def collect_feedback(feedback: Feedback) -> dict[str, str]:
+    """Collect and log PII-redacted user feedback to Cloud Logging."""
+    sanitized = feedback.model_copy(
+        update={"text": redact_pii_text(feedback.text or "")}
+    )
+    log_structured_event(
+        "USER_FEEDBACK",
+        f"Received feedback score={sanitized.score}",
+        component="feedback",
+        structured_data=sanitized.model_dump(),
+    )
+    return {"status": "success"}
 
 
 # Main execution
